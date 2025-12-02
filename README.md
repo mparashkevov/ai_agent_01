@@ -52,3 +52,20 @@ Tools provided:
 
 Security:
 - Indexing and querying use an LLM provider; do not expose API keys in public repos. Restrict network access and require auth before exposing endpoints.
+
+Ollama (local LLM) support
+--------------------------
+This project supports using a local Ollama runtime as the LLM provider. If you run an Ollama daemon locally, set `OLLAMA_URL` (default `http://localhost:11434`) and `OLLAMA_MODEL` (default `llama-3.1`). The agent exposes tools to pull models and generate text via Ollama.
+
+Pull a model with the helper script:
+
+```bash
+./scripts/pull_ollama_model.sh llama-3.1
+```
+
+Use the Ollama tools via the `/run` endpoint:
+
+- Pull a model: `{ "tool": "ollama.pull", "params": { "model": "llama-3.1" } }`
+- Generate text: `{ "tool": "ollama.generate", "params": { "model": "llama-3.1", "prompt": "Hello" } }`
+
+If `OLLAMA_URL` is configured, `index.query` will prefer Ollama and will use files under `docs_path` as context for answering queries.

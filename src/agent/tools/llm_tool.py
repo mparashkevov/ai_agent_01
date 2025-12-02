@@ -1,7 +1,8 @@
 import os
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 from ..utils.config import get_config
+from ..tools.ollama_tool import generate as ollama_generate
 
 cfg = get_config()
 
@@ -40,8 +41,44 @@ def build_index(index_name: str = "default", docs_path: Optional[str] = None) ->
         return False, str(e)
 
 
-def query_index(index_name: str = "default", query: str = "", top_k: int = 3) -> Tuple[bool, str]:
-    """Query a previously saved index.<index_name>.json and return textual result."""
+def _collect_texts_from_dir(dirpath: str, max_file_size: int = 200 * 1024) -> List[str]:
+    parts: List[str] = []
+    for root, _, files in os.walk(dirpath):
+        for fn in files:
+            if fn.lower().endswith((".txt", ".md", ".rst", ".json", ".mdx")):
+                p = os.path.join(root, fn)
+                try:
+                    size = os.path.getsize(p)
+                    if size > max_file_size:
+                        continue
+                    with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                        parts.append(f"== {os.path.relpath(p, dirpath)} ==\n" + fh.read())
+                except Exception:
+                    continue
+    return parts
+
+
+def query_index(index_name: str = "default", query: str = "", top_k: int = 3, docs_path: Optional[str] = None) -> Tuple[bool, str]:
+    """Query a previously saved index.<index_name>.json and return textual result.
+
+    If `OLLAMA_URL` is set in the environment, this will fall back to using local Ollama
+    to answer the question using documents from `docs_path` (relative to AGENT_BASE_DIR).
+    """
+    # Prefer Ollama local runtime if configured
+    ollama_url = os.getenv("OLLAMA_URL")
+    if ollama_url:
+        docs_path = docs_path or "."
+        docs_full = os.path.normpath(os.path.join(cfg.agent_base_dir, docs_path))
+        if not docs_full.startswith(cfg.agent_base_dir):
+            return False, "Access denied to docs path"
+
+        parts = _collect_texts_from_dir(docs_full)
+        context = "\n\n---\n\n".join(parts[:50])
+        prompt = f"Context:\n{context}\n\nQuestion: {query}\nAnswer:" if context else f"Question: {query}\nAnswer:"
+        ok, out = ollama_generate(prompt, model=os.getenv("OLLAMA_MODEL"))
+        return ok, out
+
+    # Fallback to llama-index if available
     if not _LLM_AVAILABLE:
         return False, f"llama-index not available: {_LLM_ERR}"
 
