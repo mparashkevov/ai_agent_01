@@ -1,0 +1,10 @@
+version: '3.8'
+services:
+  agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - AGENT_BASE_DIR=/workspace
+    volumes:
+      - ./:/workspace
