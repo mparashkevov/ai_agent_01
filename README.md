@@ -69,3 +69,18 @@ Use the Ollama tools via the `/run` endpoint:
 - Generate text: `{ "tool": "ollama.generate", "params": { "model": "llama-3.1", "prompt": "Hello" } }`
 
 If `OLLAMA_URL` is configured, `index.query` will prefer Ollama and will use files under `docs_path` as context for answering queries.
+
+Chat sessions
+-------------
+The root page (`/`) now serves a lightweight chat UI that is session-aware. Sessions are stored in memory by the server and include conversation history.
+
+Controls available in the UI:
+- **New Session**: start a fresh conversation.
+- **Clear Session**: clear the history for the current session (server-side).
+- **Docs path** + **Use index**: when checked, the agent will include indexed document context from the given `docs_path` (relative to `AGENT_BASE_DIR`) when answering the prompt.
+
+Behavior:
+- The UI POSTs to `/chat` with `{ prompt, session_id?, docs_path?, use_index? }` and receives `{ ok, session_id, response, history }`.
+- If `use_index` is true and `docs_path` exists, the agent will try to query the index (or use Ollama with documents) to provide context for the answer.
+
+Note: Sessions are in-memory and will be lost if the server restarts. For production, consider a persistent session store and add authentication.
