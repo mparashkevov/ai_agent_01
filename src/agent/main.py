@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi import Path
 import uuid
@@ -17,6 +17,8 @@ from .tools import (
     pull_model,
     generate,
 )
+from .tools.ollama_tool import generate_stream as _ollama_generate_stream
+from .utils import session_store
 
 cfg = get_config()
 
@@ -113,19 +115,33 @@ async def root():
                         append('bot', '...');
                         try{
                             const body = { prompt: value, session_id: session_id, docs_path: docsPathEl.value || null, use_index: useIndexEl.checked };
-                            const resp = await fetch('/chat', {
-                                method: 'POST', headers:{'Content-Type':'application/json'},
-                                body: JSON.stringify(body)
-                            });
-                            const data = await resp.json();
-                            // remove the last '...' placeholder
-                            chat.removeChild(chat.lastChild);
-                            if(data.session_id) setSession(data.session_id);
-                            if(data.ok){
-                                append('bot', data.response || '(empty)');
-                            } else {
-                                append('bot', 'Error: '+(data.error||JSON.stringify(data)) );
-                            }
+                            const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+                            const wsUrl = `${proto}//${location.host}/ws/chat`;
+                            const ws = new WebSocket(wsUrl);
+                            ws.onopen = () => { ws.send(JSON.stringify(body)); };
+                            ws.onmessage = (ev) => {
+                                try {
+                                    const msg = JSON.parse(ev.data);
+                                    if(msg.type === 'chunk'){
+                                        // remove placeholder if still present
+                                        if(chat.lastChild && chat.lastChild.textContent && chat.lastChild.textContent.includes('...')){
+                                            chat.removeChild(chat.lastChild);
+                                        }
+                                        append('bot', msg.data);
+                                    } else if(msg.type === 'done'){
+                                        if(msg.session_id) setSession(msg.session_id);
+                                        append('bot', msg.response || '(empty)');
+                                        ws.close();
+                                    } else if(msg.type === 'error'){
+                                        append('bot', 'Error: '+msg.error);
+                                        ws.close();
+                                    }
+                                } catch(e){
+                                    append('bot','Error parsing message:'+e.message);
+                                }
+                            };
+                            ws.onerror = (e) => { append('bot','WebSocket error'); };
+                            ws.onclose = () => {};
                         }catch(e){
                             chat.removeChild(chat.lastChild);
                             append('bot', 'Network error: '+e.message);
@@ -148,8 +164,8 @@ class ChatRequest(BaseModel):
     use_index: bool | None = False
 
 
-# Simple in-memory session store: { session_id: [ {role:'user'|'assistant', 'text':...}, ... ] }
-_sessions = {}
+# Use persistent session store (SQLite)
+session_store.init_db()
 
 
 @app.post('/chat')
@@ -164,16 +180,13 @@ async def chat_endpoint(req: ChatRequest):
         raise HTTPException(status_code=400, detail="empty prompt")
 
     sid = req.session_id or str(uuid.uuid4())
-    # initialize session if missing
-    if sid not in _sessions:
-        _sessions[sid] = []
-
-    # append user message
-    _sessions[sid].append({"role": "user", "text": prompt_text})
-
-    # build context string from history
+    # ensure persistent session exists and save user message
+    session_store.create_session(sid)
+    session_store.save_message(sid, "user", prompt_text)
+    # build context string from persistent history
+    history = session_store.get_history(sid)
     history_lines: List[str] = []
-    for m in _sessions[sid]:
+    for m in history:
         role = m.get("role")
         text = m.get("text", "")
         if role == "user":
@@ -208,28 +221,97 @@ async def chat_endpoint(req: ChatRequest):
         ok, out = generate(final_prompt, model=model, temperature=temp)
         if not ok:
             # model/generator error
-            _sessions[sid].append({"role": "assistant", "text": f"(error) {out}"})
-            return {"ok": False, "session_id": sid, "error": out, "history": _sessions[sid]}
+            session_store.save_message(sid, "assistant", f"(error) {out}")
+            return {"ok": False, "session_id": sid, "error": out, "history": session_store.get_history(sid)}
 
         # append assistant reply to session
-        _sessions[sid].append({"role": "assistant", "text": out})
-        return {"ok": True, "session_id": sid, "response": out, "history": _sessions[sid]}
+        session_store.save_message(sid, "assistant", out)
+        return {"ok": True, "session_id": sid, "response": out, "history": session_store.get_history(sid)}
     except Exception as e:
-        _sessions[sid].append({"role": "assistant", "text": f"(exception) {str(e)}"})
-        return {"ok": False, "session_id": sid, "error": str(e), "history": _sessions[sid]}
+        session_store.save_message(sid, "assistant", f"(exception) {str(e)}")
+        return {"ok": False, "session_id": sid, "error": str(e), "history": session_store.get_history(sid)}
 
 
 @app.get('/sessions/{session_id}')
 async def get_session(session_id: str = Path(...)):
     """Return session history for given `session_id`."""
-    return {"session_id": session_id, "history": _sessions.get(session_id, [])}
+    return {"session_id": session_id, "history": session_store.get_history(session_id)}
 
 
 @app.post('/sessions/{session_id}/clear')
 async def clear_session(session_id: str = Path(...)):
     """Clear session history."""
-    _sessions.pop(session_id, None)
+    session_store.clear_session(session_id)
     return {"ok": True, "session_id": session_id}
+
+
+@app.get('/sessions')
+async def list_sessions():
+    """Return list of known sessions (persistent)."""
+    return {"sessions": session_store.list_sessions()}
+
+
+@app.websocket('/ws/chat')
+async def websocket_chat(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        data = await websocket.receive_json()
+        prompt_text = (data.get('prompt') or '').strip()
+        if not prompt_text:
+            await websocket.send_json({'type': 'error', 'error': 'empty prompt'})
+            await websocket.close()
+            return
+
+        sid = data.get('session_id') or str(uuid.uuid4())
+        session_store.create_session(sid)
+        session_store.save_message(sid, 'user', prompt_text)
+
+        # build history
+        history = session_store.get_history(sid)
+        history_lines = []
+        for m in history:
+            if m.get('role') == 'user':
+                history_lines.append(f"User: {m.get('text','')}")
+            else:
+                history_lines.append(f"Assistant: {m.get('text','')}")
+
+        context_parts = []
+        if data.get('use_index') and data.get('docs_path'):
+            ok_idx, out_idx = query_index(index_name='default', query=prompt_text, docs_path=data.get('docs_path'))
+            if ok_idx:
+                context_parts.append(f"SearchResults:\n{out_idx}")
+            else:
+                context_parts.append(f"(index error: {out_idx})")
+
+        system_prompt = "\n".join(history_lines[-20:])
+        if context_parts:
+            system_prompt = system_prompt + "\n\nContext:\n" + "\n\n".join(context_parts)
+
+        final_prompt = system_prompt + "\n\nAssistant:" if system_prompt else f"User: {prompt_text}\nAssistant:"
+        if not system_prompt:
+            final_prompt = f"User: {prompt_text}\nAssistant:"
+
+        model = data.get('model')
+        temp = float(data.get('temperature') or 0.0)
+
+        # stream from ollama_generate_stream
+        full_resp = ''
+        try:
+            async for chunk in _ollama_generate_stream(final_prompt, model=model, temperature=temp):
+                # send chunk event
+                await websocket.send_json({'type': 'chunk', 'data': chunk})
+                full_resp += chunk
+        except Exception as e:
+            await websocket.send_json({'type': 'error', 'error': str(e)})
+            await websocket.close()
+            return
+
+        # save assistant reply and finish
+        session_store.save_message(sid, 'assistant', full_resp)
+        await websocket.send_json({'type': 'done', 'session_id': sid, 'response': full_resp})
+        await websocket.close()
+    except WebSocketDisconnect:
+        return
 
 
 @app.get("/tools")
