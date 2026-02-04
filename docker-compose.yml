@@ -1,16 +1,17 @@
+version: '3.8'
+
 services:
   agent:
     build: .
     ports:
       - "8000:8000"
+    volumes:
+      - ./src:/app/src
+      - ./agent_sessions.db:/app/agent_sessions.db
+      - ./workspace:/workspace
     environment:
       - AGENT_BASE_DIR=/workspace
       - OLLAMA_URL=http://host.docker.internal:11434
-      - OLLAMA_MODEL=llama-3.1
-    volumes:
-      - ./:/workspace
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+      - OLLAMA_MODEL=llama3.1
+    user: root # Ensure permissions for now, or match host user
+    command: uvicorn src.agent.main:app --host 0.0.0.0 --port 8000 --reload
